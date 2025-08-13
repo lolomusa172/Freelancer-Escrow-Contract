@@ -8,6 +8,8 @@
 (define-constant err-expired (err u106))
 (define-constant err-not-expired (err u107))
 (define-constant err-invalid-amount (err u108))
+(define-constant err-already-rated (err u109))
+(define-constant err-invalid-rating (err u110))
 
 (define-constant status-pending u1)
 (define-constant status-funded u2)
@@ -65,6 +67,27 @@
     { balance: uint }
 )
 
+(define-map user-ratings
+    { user: principal }
+    {
+        total-score: uint,
+        rating-count: uint,
+        average-rating: uint,
+    }
+)
+
+(define-map escrow-ratings
+    {
+        escrow-id: uint,
+        rater: principal,
+    }
+    {
+        rating: uint,
+        comment: (string-ascii 200),
+        rated-at: uint,
+    }
+)
+
 (define-read-only (get-escrow (escrow-id uint))
     (map-get? escrows { escrow-id: escrow-id })
 )
@@ -100,6 +123,26 @@
         escrow-data (> stacks-block-height (get deadline escrow-data))
         false
     )
+)
+
+(define-read-only (get-user-rating (user principal))
+    (default-to {
+        total-score: u0,
+        rating-count: u0,
+        average-rating: u0,
+    }
+        (map-get? user-ratings { user: user })
+    )
+)
+
+(define-read-only (get-escrow-rating
+        (escrow-id uint)
+        (rater principal)
+    )
+    (map-get? escrow-ratings {
+        escrow-id: escrow-id,
+        rater: rater,
+    })
 )
 
 (define-public (create-escrow
@@ -374,6 +417,62 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        (ok true)
+    )
+)
+
+(define-public (rate-user
+        (escrow-id uint)
+        (rating uint)
+        (comment (string-ascii 200))
+    )
+    (let (
+            (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
+            (client (get client escrow-data))
+            (freelancer (get freelancer escrow-data))
+            (rated-user (if (is-eq tx-sender client)
+                freelancer
+                client
+            ))
+            (existing-rating (get-escrow-rating escrow-id tx-sender))
+            (current-user-rating (get-user-rating rated-user))
+            (current-total (get total-score current-user-rating))
+            (current-count (get rating-count current-user-rating))
+        )
+        (asserts! (is-eq (get status escrow-data) status-completed)
+            err-invalid-status
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender client)
+                (is-eq tx-sender freelancer)
+            )
+            err-unauthorized
+        )
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (is-none existing-rating) err-already-rated)
+
+        (map-set escrow-ratings {
+            escrow-id: escrow-id,
+            rater: tx-sender,
+        } {
+            rating: rating,
+            comment: comment,
+            rated-at: stacks-block-height,
+        })
+
+        (let (
+                (new-total (+ current-total rating))
+                (new-count (+ current-count u1))
+                (new-average (/ new-total new-count))
+            )
+            (map-set user-ratings { user: rated-user } {
+                total-score: new-total,
+                rating-count: new-count,
+                average-rating: new-average,
+            })
+        )
+
         (ok true)
     )
 )
