@@ -19,6 +19,10 @@
 (define-constant status-cancelled u6)
 (define-constant status-completed u7)
 
+(define-constant schedule-type-none u0)
+(define-constant schedule-type-fixed u1)
+(define-constant schedule-type-milestone u2)
+
 (define-data-var next-escrow-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 
@@ -88,6 +92,32 @@
     }
 )
 
+(define-map payment-schedules
+    { escrow-id: uint }
+    {
+        schedule-type: uint,
+        total-payments: uint,
+        payment-amount: uint,
+        payment-interval: uint,
+        next-payment-block: uint,
+        payments-released: uint,
+        auto-release-enabled: bool,
+    }
+)
+
+(define-map payment-history
+    {
+        escrow-id: uint,
+        payment-index: uint,
+    }
+    {
+        amount: uint,
+        released-at: uint,
+        released-by: (optional principal),
+        auto-released: bool,
+    }
+)
+
 (define-read-only (get-escrow (escrow-id uint))
     (map-get? escrows { escrow-id: escrow-id })
 )
@@ -145,6 +175,33 @@
     })
 )
 
+(define-read-only (get-payment-schedule (escrow-id uint))
+    (map-get? payment-schedules { escrow-id: escrow-id })
+)
+
+(define-read-only (get-payment-history
+        (escrow-id uint)
+        (payment-index uint)
+    )
+    (map-get? payment-history {
+        escrow-id: escrow-id,
+        payment-index: payment-index,
+    })
+)
+
+(define-read-only (is-payment-due (escrow-id uint))
+    (match (get-payment-schedule escrow-id)
+        schedule-data (and
+            (get auto-release-enabled schedule-data)
+            (<= (get next-payment-block schedule-data) stacks-block-height)
+            (< (get payments-released schedule-data)
+                (get total-payments schedule-data)
+            )
+        )
+        false
+    )
+)
+
 (define-public (create-escrow
         (freelancer principal)
         (amount uint)
@@ -177,6 +234,41 @@
     )
 )
 
+(define-public (create-payment-schedule
+        (escrow-id uint)
+        (schedule-type uint)
+        (total-payments uint)
+        (payment-interval uint)
+        (auto-release bool)
+    )
+    (let (
+            (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
+            (amount (get amount escrow-data))
+            (payment-amount (/ amount total-payments))
+        )
+        (asserts! (is-eq tx-sender (get client escrow-data)) err-unauthorized)
+        (asserts! (is-eq (get status escrow-data) status-pending)
+            err-invalid-status
+        )
+        (asserts! (> total-payments u0) err-invalid-amount)
+        (asserts! (> payment-interval u0) err-invalid-amount)
+        (asserts! (<= schedule-type schedule-type-milestone) err-invalid-amount)
+        (asserts! (is-none (get-payment-schedule escrow-id)) err-already-exists)
+
+        (map-set payment-schedules { escrow-id: escrow-id } {
+            schedule-type: schedule-type,
+            total-payments: total-payments,
+            payment-amount: payment-amount,
+            payment-interval: payment-interval,
+            next-payment-block: u0,
+            payments-released: u0,
+            auto-release-enabled: auto-release,
+        })
+
+        (ok true)
+    )
+)
+
 (define-public (fund-escrow (escrow-id uint))
     (let (
             (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
@@ -190,11 +282,107 @@
 
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
 
+        (match (get-payment-schedule escrow-id)
+            schedule-data (map-set payment-schedules { escrow-id: escrow-id }
+                (merge schedule-data { next-payment-block: (+ stacks-block-height (get payment-interval schedule-data)) })
+            )
+            true
+        )
+
         (map-set escrows { escrow-id: escrow-id }
             (merge escrow-data {
                 status: status-funded,
                 funded-at: (some stacks-block-height),
             })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (release-scheduled-payment (escrow-id uint))
+    (let (
+            (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
+            (schedule-data (unwrap! (get-payment-schedule escrow-id) err-not-found))
+            (freelancer (get freelancer escrow-data))
+            (payment-amount (get payment-amount schedule-data))
+            (current-payments (get payments-released schedule-data))
+            (platform-fee (calculate-platform-fee payment-amount))
+            (net-payment (- payment-amount platform-fee))
+        )
+        (asserts! (is-eq (get status escrow-data) status-funded)
+            err-invalid-status
+        )
+        (asserts! (< current-payments (get total-payments schedule-data))
+            err-invalid-status
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get client escrow-data))
+                (and
+                    (get auto-release-enabled schedule-data)
+                    (<= (get next-payment-block schedule-data)
+                        stacks-block-height
+                    )
+                )
+            )
+            err-unauthorized
+        )
+
+        (try! (as-contract (stx-transfer? net-payment tx-sender freelancer)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+
+        (map-set payment-history {
+            escrow-id: escrow-id,
+            payment-index: current-payments,
+        } {
+            amount: payment-amount,
+            released-at: stacks-block-height,
+            released-by: (if (is-eq tx-sender (get client escrow-data))
+                (some tx-sender)
+                none
+            ),
+            auto-released: (and
+                (get auto-release-enabled schedule-data)
+                (<= (get next-payment-block schedule-data) stacks-block-height)
+            ),
+        })
+
+        (let ((new-payments-released (+ current-payments u1)))
+            (if (is-eq new-payments-released (get total-payments schedule-data))
+                (map-set escrows { escrow-id: escrow-id }
+                    (merge escrow-data {
+                        status: status-completed,
+                        completed-at: (some stacks-block-height),
+                    })
+                )
+                (map-set payment-schedules { escrow-id: escrow-id }
+                    (merge schedule-data {
+                        payments-released: new-payments-released,
+                        next-payment-block: (+ stacks-block-height
+                            (get payment-interval schedule-data)
+                        ),
+                    })
+                )
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (toggle-auto-release (escrow-id uint))
+    (let (
+            (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
+            (schedule-data (unwrap! (get-payment-schedule escrow-id) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get client escrow-data)) err-unauthorized)
+        (asserts! (is-eq (get status escrow-data) status-funded)
+            err-invalid-status
+        )
+
+        (map-set payment-schedules { escrow-id: escrow-id }
+            (merge schedule-data { auto-release-enabled: (not (get auto-release-enabled schedule-data)) })
         )
 
         (ok true)
