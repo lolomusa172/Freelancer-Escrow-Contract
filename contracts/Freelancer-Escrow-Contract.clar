@@ -10,6 +10,12 @@
 (define-constant err-invalid-amount (err u108))
 (define-constant err-already-rated (err u109))
 (define-constant err-invalid-rating (err u110))
+(define-constant err-portfolio-exists (err u111))
+(define-constant err-portfolio-not-found (err u112))
+(define-constant err-invalid-skill (err u113))
+(define-constant err-escrow-not-completed (err u114))
+(define-constant err-already-verified (err u115))
+(define-constant err-invalid-portfolio-data (err u116))
 
 (define-constant status-pending u1)
 (define-constant status-funded u2)
@@ -118,6 +124,35 @@
     }
 )
 
+(define-map freelancer-portfolios
+    { freelancer: principal }
+    {
+        bio: (string-utf8 500),
+        skills: (list 20 (string-utf8 50)),
+        portfolio-items: (list 10 {
+            title: (string-utf8 100),
+            description: (string-utf8 300),
+            project-url: (optional (string-utf8 200))
+        }),
+        total-verified-skills: uint,
+        profile-created-at: uint,
+    }
+)
+
+(define-map skill-verifications
+    { freelancer: principal, skill: (string-utf8 50), verifier: principal }
+    {
+        escrow-id: uint,
+        verified-at: uint,
+        endorsement-note: (optional (string-utf8 200)),
+    }
+)
+
+(define-map skill-verification-counts
+    { freelancer: principal, skill: (string-utf8 50) }
+    { count: uint }
+)
+
 (define-read-only (get-escrow (escrow-id uint))
     (map-get? escrows { escrow-id: escrow-id })
 )
@@ -199,6 +234,42 @@
             )
         )
         false
+    )
+)
+
+(define-read-only (get-portfolio (freelancer principal))
+    (map-get? freelancer-portfolios { freelancer: freelancer })
+)
+
+(define-read-only (get-skill-verification-count 
+        (freelancer principal)
+        (skill (string-utf8 50))
+    )
+    (default-to u0 (get count (map-get? skill-verification-counts {
+        freelancer: freelancer,
+        skill: skill,
+    })))
+)
+
+(define-read-only (has-skill-verification
+        (freelancer principal)
+        (skill (string-utf8 50))
+        (verifier principal)
+    )
+    (is-some (map-get? skill-verifications {
+        freelancer: freelancer,
+        skill: skill,
+        verifier: verifier,
+    }))
+)
+
+(define-read-only (get-verified-skills (freelancer principal))
+    (match (get-portfolio freelancer)
+        portfolio-data {
+            skills: (get skills portfolio-data),
+            total-verified: (get total-verified-skills portfolio-data),
+        }
+        { skills: (list), total-verified: u0 }
     )
 )
 
@@ -659,6 +730,120 @@
                 rating-count: new-count,
                 average-rating: new-average,
             })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (create-portfolio
+        (bio (string-utf8 500))
+        (skills (list 20 (string-utf8 50)))
+        (portfolio-items (list 10 {
+            title: (string-utf8 100),
+            description: (string-utf8 300),
+            project-url: (optional (string-utf8 200))
+        }))
+    )
+    (begin
+        (asserts! (is-none (get-portfolio tx-sender)) err-portfolio-exists)
+        (asserts! (> (len bio) u0) err-invalid-portfolio-data)
+        (asserts! (> (len skills) u0) err-invalid-portfolio-data)
+        (asserts! (<= (len skills) u20) err-invalid-portfolio-data)
+        (asserts! (<= (len portfolio-items) u10) err-invalid-portfolio-data)
+
+        (map-set freelancer-portfolios { freelancer: tx-sender } {
+            bio: bio,
+            skills: skills,
+            portfolio-items: portfolio-items,
+            total-verified-skills: u0,
+            profile-created-at: stacks-block-height,
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (update-portfolio
+        (bio (string-utf8 500))
+        (skills (list 20 (string-utf8 50)))
+        (portfolio-items (list 10 {
+            title: (string-utf8 100),
+            description: (string-utf8 300),
+            project-url: (optional (string-utf8 200))
+        }))
+    )
+    (let (
+            (existing-portfolio (unwrap! (get-portfolio tx-sender) err-portfolio-not-found))
+        )
+        (asserts! (> (len bio) u0) err-invalid-portfolio-data)
+        (asserts! (> (len skills) u0) err-invalid-portfolio-data)
+        (asserts! (<= (len skills) u20) err-invalid-portfolio-data)
+        (asserts! (<= (len portfolio-items) u10) err-invalid-portfolio-data)
+
+        (map-set freelancer-portfolios { freelancer: tx-sender } {
+            bio: bio,
+            skills: skills,
+            portfolio-items: portfolio-items,
+            total-verified-skills: (get total-verified-skills existing-portfolio),
+            profile-created-at: (get profile-created-at existing-portfolio),
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (add-skill-verification
+        (escrow-id uint)
+        (freelancer principal)
+        (skill (string-utf8 50))
+        (endorsement-note (optional (string-utf8 200)))
+    )
+    (let (
+            (escrow-data (unwrap! (get-escrow escrow-id) err-not-found))
+            (portfolio-data (unwrap! (get-portfolio freelancer) err-portfolio-not-found))
+            (existing-verification (map-get? skill-verifications {
+                freelancer: freelancer,
+                skill: skill,
+                verifier: tx-sender,
+            }))
+            (current-count (get-skill-verification-count freelancer skill))
+        )
+        (asserts! (is-eq tx-sender (get client escrow-data)) err-unauthorized)
+        (asserts! (is-eq freelancer (get freelancer escrow-data)) err-unauthorized)
+        (asserts! (is-eq (get status escrow-data) status-completed) err-escrow-not-completed)
+        (asserts! (> (len skill) u0) err-invalid-skill)
+        (asserts! (<= (len skill) u50) err-invalid-skill)
+        (asserts! (is-none existing-verification) err-already-verified)
+        
+        ;; Verify that the skill is in the freelancer's skills list
+        (asserts! (is-some (index-of (get skills portfolio-data) skill)) err-invalid-skill)
+
+        (map-set skill-verifications {
+            freelancer: freelancer,
+            skill: skill,
+            verifier: tx-sender,
+        } {
+            escrow-id: escrow-id,
+            verified-at: stacks-block-height,
+            endorsement-note: endorsement-note,
+        })
+
+        (map-set skill-verification-counts {
+            freelancer: freelancer,
+            skill: skill,
+        } {
+            count: (+ current-count u1),
+        })
+
+        ;; Update total verified skills count in portfolio
+        (if (is-eq current-count u0)
+            (map-set freelancer-portfolios { freelancer: freelancer }
+                (merge portfolio-data {
+                    total-verified-skills: (+ (get total-verified-skills portfolio-data) u1),
+                })
+            )
+            true
         )
 
         (ok true)
